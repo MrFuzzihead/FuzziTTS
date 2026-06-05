@@ -7,11 +7,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Default voice (model + config). Add more voices the same way.
+# Default voice (model + config). Use piper's own downloader so the files land
+# with the exact names/format piper expects (a raw curl from HF returns an LFS
+# pointer, not the real model, which makes piper fail with "Unable to find voice").
+# Add more voices by appending their names, e.g. `... en_US-amy-low en_US-ryan-high`.
 RUN mkdir -p models \
- && BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low \
- && curl -L -o models/en_US-amy-low.onnx      $BASE/en_US-amy-low.onnx \
- && curl -L -o models/en_US-amy-low.onnx.json $BASE/en_US-amy-low.onnx.json
+ && python3 -m piper.download_voices en_US-amy-low --download-dir /app/models
 
 COPY package.json ./
 RUN npm install --omit=dev

@@ -5,9 +5,13 @@ services:
     container_name: fuzzitts
     restart: unless-stopped
     ports:
-      - "${PORT:-8080}:8080"
+      # Change ONLY the host side to avoid clashes, e.g. HOST_PORT=8085.
+      # The container always listens on 8080 (matched by the env + healthcheck).
+      - "${HOST_PORT:-8080}:8080"
     environment:
       # Service config (see README). Values here override the image defaults.
+      # Leave PORT at 8080 — it must match the container side of the mapping
+      # above and the healthcheck below. To publish elsewhere, set HOST_PORT.
       PORT: "8080"
       PIPER_MODEL_DIR: "/app/models"
       MAX_TEXT: "${MAX_TEXT:-1000}"
@@ -18,12 +22,11 @@ services:
     #
     # To manage voices from the host instead, uncomment the bind mount below.
     # NOTE: a bind mount SHADOWS the image's baked-in models, so you must first
-    # populate ./models yourself, e.g.:
-    #   mkdir -p models
-    #   BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low
-    #   curl -L -o models/en_US-amy-low.onnx      $BASE/en_US-amy-low.onnx
-    #   curl -L -o models/en_US-amy-low.onnx.json $BASE/en_US-amy-low.onnx.json
-    # Then add any extra <voice>.onnx + <voice>.onnx.json pairs and a matching
+    # populate ./models yourself with piper's downloader (a raw curl from HF
+    # returns an LFS pointer, not the real model):
+    #   pip install piper-tts
+    #   python -m piper.download_voices en_US-amy-low --download-dir ./models
+    # Then add any extra voices (e.g. ... en_US-ryan-high) and a matching
     # entry in the VOICES map in server.js.
     # volumes:
     #   - ./models:/app/models
@@ -33,5 +36,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-

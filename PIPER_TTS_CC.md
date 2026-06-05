@@ -210,9 +210,7 @@ WORKDIR /app
 
 # Default voice (model + config). Add more voices the same way.
 RUN mkdir -p models \
- && BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low \
- && curl -L -o models/en_US-amy-low.onnx      $BASE/en_US-amy-low.onnx \
- && curl -L -o models/en_US-amy-low.onnx.json $BASE/en_US-amy-low.onnx.json
+ && python3 -m piper.download_voices en_US-amy-low --download-dir /app/models
 
 COPY package.json ./
 RUN npm install --omit=dev
@@ -246,11 +244,10 @@ curl "http://localhost:8080/say?text=hello%20world&format=dfpwm" --output hello.
 # 2. Piper
 pip install piper-tts
 
-# 3. A voice (model + its .onnx.json config) into ./models
-mkdir -p models
-BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low
-curl -L -o models/en_US-amy-low.onnx      $BASE/en_US-amy-low.onnx
-curl -L -o models/en_US-amy-low.onnx.json $BASE/en_US-amy-low.onnx.json
+# 3. A voice (model + its .onnx.json config) into ./models.
+#    Use piper's own downloader; a raw curl from Hugging Face returns an LFS
+#    pointer rather than the real model.
+python3 -m piper.download_voices en_US-amy-low --download-dir ./models
 
 # 4. Start
 npm install && npm start

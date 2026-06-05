@@ -64,8 +64,9 @@ docker compose down               # stop and remove
 Compose works out of the box with the voice baked into the image. To manage
 voices from the host, uncomment the `volumes:` bind mount in
 `docker-compose.yml` (and populate `./models` first — see the comments there).
-Config can be overridden via env vars or a `.env` file, e.g. `PORT` and
-`MAX_TEXT`.
+To publish on a different host port, set `HOST_PORT` (the container always
+listens on `8080`), e.g. `HOST_PORT=8085 docker compose up -d`. `MAX_TEXT` and
+other settings can likewise be overridden via env vars or a `.env` file.
 
 ### Local
 
@@ -78,11 +79,10 @@ Config can be overridden via env vars or a `.env` file, e.g. `PORT` and
 # 2. Piper
 pip install piper-tts
 
-# 3. A voice (model + its .onnx.json config) into ./models
-mkdir models
-$BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low"
-curl -L -o models/en_US-amy-low.onnx      "$BASE/en_US-amy-low.onnx"
-curl -L -o models/en_US-amy-low.onnx.json "$BASE/en_US-amy-low.onnx.json"
+# 3. A voice (model + its .onnx.json config) into ./models.
+#    Use piper's own downloader — a raw curl from Hugging Face returns an
+#    LFS pointer, not the real model, and piper then can't load it.
+python -m piper.download_voices en_US-amy-low --download-dir models
 
 # 4. Start
 npm install
