@@ -1,0 +1,37 @@
+services:
+  fuzzitts:
+    build: .
+    image: fuzzitts
+    container_name: fuzzitts
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # Service config (see README). Values here override the image defaults.
+      PORT: "8080"
+      PIPER_MODEL_DIR: "/app/models"
+      MAX_TEXT: "${MAX_TEXT:-1000}"
+      # PIPER_BIN: "piper"
+      # FFMPEG_BIN: "ffmpeg"
+    # By default, the bundled en_US-amy voice baked into the image is used,
+    # so `docker compose up` works with no extra setup.
+    #
+    # To manage voices from the host instead, uncomment the bind mount below.
+    # NOTE: a bind mount SHADOWS the image's baked-in models, so you must first
+    # populate ./models yourself, e.g.:
+    #   mkdir -p models
+    #   BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low
+    #   curl -L -o models/en_US-amy-low.onnx      $BASE/en_US-amy-low.onnx
+    #   curl -L -o models/en_US-amy-low.onnx.json $BASE/en_US-amy-low.onnx.json
+    # Then add any extra <voice>.onnx + <voice>.onnx.json pairs and a matching
+    # entry in the VOICES map in server.js.
+    # volumes:
+    #   - ./models:/app/models
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+
