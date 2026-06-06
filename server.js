@@ -1,31 +1,34 @@
-// FuzziTTS — optimised server.js
+// FuzziTTS — optimized server.js
 //
-// Two changes vs the original that eliminate the 7-10 s latency:
+// Fix vs previous optimized version:
+//   The old PiperWorker used `--output-raw` and declared an utterance done
+//   after 150 ms of stdout silence.  Piper splits text on sentence boundaries
+//   and synthesises each sentence in a separate burst, so the silence timer
+//   fired between sentences — cutting off "Hello! How are you doing today?"
+//   after "Hello!" and producing a hard click that manifested as degraded
+//   audio quality in pcm_u8.
 //
-//   1. PiperWorker — keeps one `piper --output-raw` process alive per model.
-//      Every fresh spawn paid 4-8 s to load the ONNX model from disk.
-//      With a warm worker that cost disappears entirely.
+//   The new worker uses `--output-dir`.  Piper writes exactly ONE .wav file
+//   per stdin line, containing the full audio for all internal sentences.
+//   Completion is detected by polling until the file reaches the byte count
+//   declared in its own WAV header — correct and timer-free.
 //
-//   2. AudioCache — stores final encoded audio bytes in memory, keyed by
-//      (text | lang | voice | format).  Reactor alarms, status messages and
-//      any phrase the in-game computer repeats are served in < 1 ms.
+// Two optimizations retained from the previous version:
+//   1. PiperWorker — one persistent piper process per model (no ONNX reload).
+//   2. AudioCache  — repeated phrases served from memory in < 1 ms.
 //
-// Utterance-completion detection
-//   Piper synthesises a whole utterance in one batch and writes all PCM to
-//   stdout in a tight burst, then goes silent waiting for the next stdin line.
-//   We treat WORKER_DRAIN_MS (default 150 ms) of stdout silence as "done".
-//   That is far shorter than the time Piper needs to synthesise the next line,
-//   so there is no risk of cross-utterance contamination.
-//
-// Pipeline: text ─► PiperWorker (reused process, no model reload)
-//                ─► raw s16le PCM Buffer
-//                ─► ffmpeg  (resample + encode, still spawned per-request)
+// Pipeline: text ─► PiperWorker (warm piper, --output-dir)
+//                ─► WAV file on disk ─► raw s16le PCM Buffer
+//                ─► ffmpeg (resample + encode)
 //                ─► encoded audio Buffer ─► AudioCache ─► HTTP response
 
-import express                              from "express";
-import { spawn }                            from "node:child_process";
-import { readFileSync, accessSync, constants } from "node:fs";
-import path                                 from "node:path";
+import express                                                   from "express";
+import { spawn }                                                  from "node:child_process";
+import { readFileSync, accessSync, mkdtempSync, readdirSync,
+  unlinkSync, openSync, readSync, closeSync,
+  existsSync, statSync, constants }                        from "node:fs";
+import path                                                       from "node:path";
+import os                                                         from "node:os";
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 const PORT       = Number(process.env.PORT             || 8080);
@@ -33,9 +36,8 @@ const PIPER_BIN  =        process.env.PIPER_BIN        || "piper";
 const FFMPEG_BIN =        process.env.FFMPEG_BIN       || "ffmpeg";
 const MODEL_DIR  =        process.env.PIPER_MODEL_DIR  || "./models";
 const MAX_TEXT   = Number(process.env.MAX_TEXT          || 1000);
-const CACHE_MAX  = Number(process.env.CACHE_MAX         || 500);   // max entries
-const CACHE_MB   = Number(process.env.CACHE_MB          || 64);    // max total MB
-const DRAIN_MS   = Number(process.env.WORKER_DRAIN_MS   || 150);   // stdout silence → utterance done
+const CACHE_MAX  = Number(process.env.CACHE_MAX         || 500);    // max entries
+const CACHE_MB   = Number(process.env.CACHE_MB          || 64);     // max total MB
 
 // ── Voice / format maps ────────────────────────────────────────────────────────
 const VOICES = {
@@ -88,42 +90,78 @@ function cacheSet(key, buf) {
   _cBytes += buf.length;
 }
 
+// ── WAV helper ────────────────────────────────────────────────────────────────
+// Standard PCM WAV layout (44-byte header):
+//   0  RIFF  (4)
+//   4  file_size - 8  (uint32 LE)
+//   8  WAVE  (4)
+//   12 fmt   (4)
+//   16 16    (uint32 LE — fmt chunk size)
+//   20 1     (uint16 LE — PCM format)
+//   22 channels (uint16 LE)
+//   24 sample_rate (uint32 LE)
+//   28 byte_rate   (uint32 LE)
+//   32 block_align (uint16 LE)
+//   34 bits_per_sample (uint16 LE)
+//   36 data  (4)
+//   40 data_size (uint32 LE)   ← we read this
+//   44 <PCM samples begin>
+//
+// Returns the expected total file size once the header is readable, or -1 if
+// the file doesn't exist yet or the header is incomplete.
+function wavExpectedSize(filePath) {
+  try {
+    const fd  = openSync(filePath, "r");
+    const hdr = Buffer.alloc(8);
+    const n   = readSync(fd, hdr, 0, 8, 36);  // read "data" id + size at offset 36
+    closeSync(fd);
+    if (n < 8 || hdr.slice(0, 4).toString("ascii") !== "data") return -1;
+    return 44 + hdr.readUInt32LE(4);           // total = header + data
+  } catch { return -1; }
+}
+
 // ── PiperWorker ───────────────────────────────────────────────────────────────
-// Wraps a long-lived `piper --output-raw` process.
-// Requests are serialised one-at-a-time through an internal queue.
+// Wraps a long-lived `piper --output-dir` process.
+// Piper writes one .wav file per stdin line; the file contains complete audio
+// for ALL internal sentences in that line.  We poll (every 20 ms) until the
+// file size matches the byte count in its WAV header, then read + delete it.
+// Requests are serialised one-at-a-time so file numbering stays in sync.
 // Public API:  synthesize(text) → Promise<Buffer>  (raw s16le PCM)
 
 class PiperWorker {
   #model;
+  #outDir;
   #proc       = null;
   #queue      = [];
   #busy       = false;
-  #chunks     = [];
-  #timer      = null;
+  #counter    = 0;
   #resolve    = null;
   #reject     = null;
+  #pollTimer  = null;
   #restarting = false;
 
   constructor(modelPath) {
-    this.#model = modelPath;
+    this.#model  = modelPath;
+    this.#outDir = mkdtempSync(path.join(os.tmpdir(), "fuzzitts-"));
     this.#start();
   }
 
   // ── Process lifecycle ──────────────────────────────────────────────────────
   #start() {
     this.#restarting = false;
-    this.#proc = spawn(PIPER_BIN, ["--model", this.#model, "--output-raw"], {
-      stdio: ["pipe", "pipe", "inherit"],
-    });
+    this.#counter    = 0;
 
-    this.#proc.stdout.on("data", chunk => {
-      if (!this.#resolve) return;
-      this.#chunks.push(chunk);
-      clearTimeout(this.#timer);
-      // Each data event resets the silence timer. When it finally fires,
-      // piper has finished this utterance and is waiting for the next line.
-      this.#timer = setTimeout(() => this.#complete(), DRAIN_MS);
-    });
+    // Remove any .wav files left over from a previous (crashed) process so
+    // file numbering starts clean.
+    try {
+      for (const f of readdirSync(this.#outDir))
+        if (f.endsWith(".wav")) unlinkSync(path.join(this.#outDir, f));
+    } catch { /* ignore */ }
+
+    this.#proc = spawn(PIPER_BIN, [
+      "--model",      this.#model,
+      "--output-dir", this.#outDir,
+    ], { stdio: ["pipe", "inherit", "inherit"] });
 
     this.#proc.on("error", err => {
       console.error(`[piper:${path.basename(this.#model)}] error:`, err.message);
@@ -132,55 +170,81 @@ class PiperWorker {
     });
 
     this.#proc.on("exit", code => {
-      // Piper should never exit while we own stdin; treat any exit as a fault.
       if (this.#resolve) this.#abort(new Error(`piper exited with code ${code}`));
       this.#scheduleRestart();
     });
 
     console.log(`[piper] worker ready — ${path.basename(this.#model)}`);
-    this.#next(); // flush anything queued during a restart
+    this.#next();  // flush anything queued during a restart
   }
 
   #scheduleRestart() {
     if (this.#restarting) return;
     this.#restarting = true;
     this.#proc = null;
+    clearTimeout(this.#pollTimer);
     setTimeout(() => this.#start(), 500);
   }
 
   // ── Request lifecycle ──────────────────────────────────────────────────────
   #abort(err) {
-    clearTimeout(this.#timer);
-    const reject  = this.#reject;
+    clearTimeout(this.#pollTimer);
+    const reject = this.#reject;
     this.#resolve = null;
     this.#reject  = null;
-    this.#chunks  = [];
     this.#busy    = false;
     reject?.(err);
-    // Do NOT call #next() — the process is dying. #start() will call it.
   }
 
-  #complete() {
-    const resolve = this.#resolve;
-    const pcm     = Buffer.concat(this.#chunks);
-    this.#resolve = null;
-    this.#reject  = null;
-    this.#chunks  = [];
-    this.#busy    = false;
-    resolve(pcm);
-    this.#next();
+  // Poll every 20 ms until the WAV file for this utterance is fully written.
+  // Phase 1: wait for the file + readable header  → get expectedSize
+  // Phase 2: wait for file.size >= expectedSize   → read PCM, clean up, resolve
+  #poll(filePath, expectedSize, attempts = 0) {
+    const MAX_ATTEMPTS = 500;  // 500 × 20 ms = 10 s hard timeout
+    if (attempts > MAX_ATTEMPTS) {
+      this.#abort(new Error(`timeout waiting for ${path.basename(filePath)}`));
+      if (!this.#restarting) this.#next();
+      return;
+    }
+
+    this.#pollTimer = setTimeout(() => {
+      try {
+        if (expectedSize < 0) expectedSize = wavExpectedSize(filePath);
+        if (expectedSize < 0) { this.#poll(filePath, -1, attempts + 1); return; }
+
+        const actual = existsSync(filePath) ? statSync(filePath).size : 0;
+        if (actual < expectedSize) { this.#poll(filePath, expectedSize, attempts + 1); return; }
+
+        // File complete — strip 44-byte WAV header to get raw s16le PCM.
+        const pcm = readFileSync(filePath).slice(44);
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+
+        const resolve = this.#resolve;
+        this.#resolve = null;
+        this.#reject  = null;
+        this.#busy    = false;
+        resolve(pcm);
+        this.#next();
+      } catch {
+        // Transient I/O error; retry next poll tick.
+        this.#poll(filePath, expectedSize, attempts + 1);
+      }
+    }, 20);
   }
 
   #next() {
     if (this.#busy || this.#restarting || !this.#queue.length || !this.#proc) return;
     this.#busy = true;
     const { text, resolve, reject } = this.#queue.shift();
+    const filePath = path.join(this.#outDir, `${this.#counter++}.wav`);
+
     this.#resolve = resolve;
     this.#reject  = reject;
     this.#proc.stdin.write(text + "\n");
+    this.#poll(filePath, -1);
   }
 
-  // ── Public ─────────────────────────────────────────────────────────────────
+  // ── Public API ─────────────────────────────────────────────────────────────
   synthesize(text) {
     return new Promise((resolve, reject) => {
       this.#queue.push({ text, resolve, reject });
@@ -190,20 +254,14 @@ class PiperWorker {
 }
 
 // ── Worker pool ───────────────────────────────────────────────────────────────
-// One warm worker per model path, created lazily or pre-warmed at startup.
 const _workers = new Map();
 
 function getWorker(modelPath) {
-  if (!_workers.has(modelPath)) {
-    _workers.set(modelPath, new PiperWorker(modelPath));
-  }
+  if (!_workers.has(modelPath)) _workers.set(modelPath, new PiperWorker(modelPath));
   return _workers.get(modelPath);
 }
 
 // ── ffmpeg (Buffer → Buffer) ───────────────────────────────────────────────────
-// Still spawned per-request (~100-300 ms startup), but now that piper's
-// 4-8 s cold-start is gone, this is a minor fraction of total latency.
-// Output is fully buffered so it can be stored in the audio cache.
 function transcode(pcmBuf, inputRate, format) {
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG_BIN, [
@@ -243,7 +301,6 @@ app.get("/say", async (req, res) => {
   const model = resolveModel(lang, voice);
   if (!model) return res.status(404).end(`no voice for ${lang}${voice ? "/" + voice : ""}`);
 
-  // Cache hit — return immediately
   const key = `${text}|${lang}|${voice ?? ""}|${format}`;
   const hit  = cacheGet(key);
   if (hit) {
@@ -252,7 +309,6 @@ app.get("/say", async (req, res) => {
     return res.end(hit);
   }
 
-  // Cache miss — synthesise, transcode, store, respond
   try {
     const rate  = modelSampleRate(model);
     const pcm   = await getWorker(model).synthesize(text);
@@ -270,10 +326,6 @@ app.get("/say", async (req, res) => {
 // ── Startup + pre-warm ────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`fuzzitts listening on :${PORT}`);
-
-  // Start a worker for every voice model that has already been downloaded.
-  // Piper loads the ONNX model when the process starts, so doing this at
-  // boot means the first real request pays zero cold-start cost.
   const seen = new Set();
   for (const file of Object.values(VOICES)) {
     if (seen.has(file)) continue;
@@ -283,8 +335,6 @@ app.listen(PORT, () => {
       accessSync(mp, constants.R_OK);
       getWorker(mp);
       console.log(`[warmup] pre-loading ${file}`);
-    } catch {
-      // Model not downloaded — will error on first request for that voice.
-    }
+    } catch { /* model not downloaded */ }
   }
 });
