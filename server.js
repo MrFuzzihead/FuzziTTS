@@ -7,7 +7,7 @@
 
 import express from "express";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -67,31 +67,19 @@ function getPool(modelPath) {
 }
 
 function spawnPiper(modelPath) {
-  // -f - : write a complete WAV to stdout per input line (OUTPUT_STDOUT).
-  // -q   : silence spdlog's per-utterance "Real-time factor" noise.
+  // -f -       : write a complete WAV to stdout per input line
+  // --json-input : stdin lines are {"text":"..."}\n
+  // -q         : silence spdlog's per-utterance "Real-time factor" noise
   // Piper's C++ binary loops on `while (getline(cin, line))` and stays alive
   // between utterances, so the ONNX model loads exactly once per process.
-  // Each stdin line is the plain text to synthesize — we do NOT use
-  // --json-input because some piper builds silently ignore it and then
-  // read the JSON literal as text.
   const p = spawn(
     PIPER_BIN,
-    ["-q", "-m", modelPath, "-f", "-"],
+    ["-q", "-m", modelPath, "-f", "-", "--json-input"],
     { stdio: ["pipe", "pipe", "inherit"] },
   );
   p._piperAlive = true;
-  p.on("exit", (code, signal) => {
-    p._piperAlive = false;
-    if (code !== null && code !== 0) {
-      console.error(
-        `piper exited code=${code} signal=${signal} model=${path.basename(modelPath)}`,
-      );
-    }
-  });
-  p.on("error", (e) => {
-    p._piperAlive = false;
-    console.error(`piper spawn error: ${e.message} (PIPER_BIN=${PIPER_BIN})`);
-  });
+  p.on("exit",  () => { p._piperAlive = false; });
+  p.on("error", () => { p._piperAlive = false; }); // spawn failed (e.g., ENOENT)
   p.stdin.on("error", () => {}); // swallow EPIPE if the peer died
   return p;
 }
@@ -211,9 +199,9 @@ function withTimeout(promise, ms, label) {
 }
 
 async function synthesizePcm(proc, text) {
-  // One utterance per line. The pipe kernel-buffers this until piper reaches
-  // its `getline(cin, ...)` loop, so we don't need to wait for the model.
-  proc.stdin.write(text + "\n");
+  // The pipe kernel-buffers this until piper reaches its `getline(cin, ...)`
+  // loop, so we don't need to wait for the model to finish loading.
+  proc.stdin.write(JSON.stringify({ text }) + "\n");
 
   return withTimeout(
     (async () => {
@@ -234,34 +222,16 @@ async function synthesizePcm(proc, text) {
 const app = express();
 let startupReady = false;
 
-function poolSnapshot() {
-  const out = [];
-  for (const [modelPath, pool] of pools) {
-    out.push({
-      model: path.basename(modelPath),
-      live: pool.all.filter((p) => p._piperAlive).length,
-      total: pool.all.length,
-    });
-  }
-  return out;
-}
-
 app.get("/healthz", (_req, res) => {
   if (!startupReady) {
-    return res.status(503).json({ ok: false, reason: "warming up", pools: [] });
+    return res.status(503).json({ ok: false, reason: "warming up" });
   }
-  // If prewarmed workers happen to have died, acquirePiper will lazy-spawn a
-  // fresh one on the next /say — the service is still functional. So we only
-  // fail healthz on hard problems (warming up, model file missing).
   const defaultModel = path.resolve(MODEL_DIR, VOICES.en);
-  if (!existsSync(defaultModel)) {
-    return res.status(503).json({
-      ok: false,
-      reason: `default model file missing: ${path.basename(defaultModel)}`,
-      pools: poolSnapshot(),
-    });
+  const pool = pools.get(defaultModel);
+  if (!pool || !pool.all.some((p) => p._piperAlive)) {
+    return res.status(503).json({ ok: false, reason: "default voice unavailable" });
   }
-  return res.json({ ok: true, pools: poolSnapshot() });
+  return res.json({ ok: true });
 });
 
 app.get("/say", async (req, res) => {
@@ -325,29 +295,20 @@ app.get("/say", async (req, res) => {
 });
 
 function prewarmPools() {
-  // Only pre-warm voices whose model file is actually on disk. The bundled
-  // image only ships en_US-amy-low; pre-spawning workers for missing models
-  // just produces a flurry of immediate exits and wastes CPU.
-  // Other voices are lazy-spawned by acquirePiper on first /say — the first
-  // request pays the model-load cost, every subsequent one is fast.
   const seen = new Set();
-  let warmed = 0;
   for (const file of Object.values(VOICES)) {
     const p = path.resolve(MODEL_DIR, file);
     if (seen.has(p)) continue;
     seen.add(p);
-    if (!existsSync(p)) continue;
     const pool = getPool(p);
     for (let i = 0; i < PIPER_POOL_SIZE; i++) {
       const proc = spawnPiper(p);
       pool.all.push(proc);
       pool.free.push(proc);
     }
-    warmed++;
   }
   startupReady = true;
-  console.log(`prewarmed ${warmed} voice pool(s) x ${PIPER_POOL_SIZE}`);
-  console.log(`(missing model files will be lazy-spawned on first /say)`);
+  console.log(`prewarmed ${seen.size} voice pool(s) x ${PIPER_POOL_SIZE}`);
 }
 
 function shutdown() {
