@@ -1,8 +1,3 @@
-// piper-tts-cc — Piper TTS transcoder for ComputerCraft speakers.
-//
-// Pipeline:  text → piper (raw s16le @ model rate) → ffmpeg (48 kHz mono,
-//            dfpwm / pcm_u8 / pcm_s8) → HTTP response body.
-
 import express from "express";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -91,8 +86,10 @@ app.get("/say", (req, res) => {
   res.on("close", cleanup);
 
   ff.on("error", (e) => res.destroyed || res.destroy(e));
-  /** @ts-ignore */
-  piperInstance.stderr.on('data', (err) => console.error(`Piper error: ${err}`));
+  if (piperInstance && piperInstance.stderr) {
+    /** @ts-ignore */
+    piperInstance.stderr.on('data', (err) => console.error(`Piper error: ${err}`));
+  }
 
   piperInstance.stdin.write(text + "\n");
   piperInstance.stdin.end();
