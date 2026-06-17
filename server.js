@@ -1,8 +1,3 @@
-// piper-tts-cc — Piper TTS transcoder for ComputerCraft speakers.
-//
-// Pipeline:  text → piper (raw s16le @ model rate) → ffmpeg (48 kHz mono,
-//            dfpwm / pcm_u8 / pcm_s8) → HTTP response body.
-
 import express from "express";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -50,6 +45,9 @@ function modelSampleRate(modelPath) {
 }
 
 const app = express();
+
+let piperInstance;
+
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 app.get("/say", (req, res) => {
@@ -61,16 +59,12 @@ app.get("/say", (req, res) => {
   if (!text) return res.status(400).end("missing text");
   if (!FORMAT_ARGS[format]) return res.status(400).end("bad format");
 
+  // The resolver is still used if we needed to dynamically spawn, but now we use the warmed default.
   const model = resolveModel(lang, voice);
   if (!model) return res.status(404).end(`no voice for ${lang}${voice ? "/" + voice : ""}`);
   const rate = modelSampleRate(model);
 
-  // Piper streams raw signed-16-bit mono PCM at the model's sample rate.
-  const piper = spawn(PIPER_BIN, ["--model", model, "--output-raw"], {
-    stdio: ["pipe", "pipe", "inherit"],
-  });
-
-  // ffmpeg resamples to 48 kHz mono and re-encodes to the requested format.
+  // ffmpeg still wraps the authenticated output of our long-lived piper process.
   const ff = spawn(
     FFMPEG_BIN,
     [
@@ -84,19 +78,31 @@ app.get("/say", (req, res) => {
   );
 
   res.setHeader("content-type", "application/octet-stream");
-  piper.stdout.pipe(ff.stdin);
+  piperInstance.stdout.pipe(ff.stdin);
   ff.stdout.pipe(res);
 
-  const cleanup = () => { piper.kill("SIGKILL"); ff.kill("SIGKILL"); };
+  const cleanup = () => ff.kill("SIGKILL");
   req.on("close", cleanup);
   res.on("close", cleanup);
-  piper.on("error", (e) => res.destroyed || res.destroy(e));
-  ff.on("error", (e) => res.destroyed || res.destroy(e));
 
-  piper.stdin.write(text + "\n");
-  piper.stdin.end();
+  ff.on("error", (e) => res.destroyed || res.destroy(e));
+  if (piperInstance && piperInstance.stderr) {
+    /** @ts-ignore */
+    piperInstance.stderr.on('data', (err) => console.error(`Piper error: ${err}`));
+  }
+
+  piperInstance.stdin.write(text + "\n");
+  piperInstance.stdin.end();
 });
 
-app.listen(PORT, () => console.log(`piper-tts-cc listening on :${PORT}`));
-
-
+app.listen(PORT, () => {
+  const defaultModel = resolveModel("en", undefined);
+  if (!defaultModel) {
+    console.error("Could not resolve default model for warming");
+    process.exit(1);
+  }
+  piperInstance = spawn(PIPER_BIN, ["--model", defaultModel, "--output-raw"], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  console.log(`piper-tts-cc listening on :${PORT}`);
+});
